@@ -12,6 +12,7 @@
   "dependencies": {
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "imapflow": "^1.2.18"
+    "imapflow": "^1.2.18",
+    "mailparser": "^3.9.6"
   }
 }

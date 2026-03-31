@@ -1,12 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
+const { simpleParser } = require('mailparser'); // ✅ แก้ชื่อจาก Parrer เป็น Parser
 
 const app = express();
 app.use(cors()); 
 app.use(express.json());
 
-// ✅ ตั้งค่าเซิร์ฟเวอร์เป็น CapuMail 100%
 const IMAP_HOST = 'capumail.com'; 
 
 const getImapConfig = (req) => {
@@ -68,6 +68,7 @@ app.get('/api/emails', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ✅ แก้ไขส่วนดึง Content ให้ใช้ Parser เพื่อลบ Header รกๆ ออก
 app.get('/api/email-content', async (req, res) => {
     const { folder, uid } = req.query;
     try {
@@ -76,10 +77,19 @@ app.get('/api/email-content', async (req, res) => {
         let lock = await client.getMailboxLock(folder || 'INBOX');
         try {
             let message = await client.fetchOne(uid, { source: true });
-            res.json({ success: true, content: message.source.toString() });
+            
+            // 🛠️ ถอดรหัส Source Code ของเมลให้กลายเป็นข้อความอ่านง่าย
+            const parsed = await simpleParser(message.source);
+            
+            res.json({ 
+                success: true, 
+                // ส่งค่าที่เป็น HTML หรือถ้าไม่มีให้ส่ง Text ธรรมดาไป
+                content: parsed.html || parsed.textAsHtml || parsed.text || "No Content" 
+            });
         } finally { lock.release(); await client.logout(); }
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-const PORT = 5001;
-app.listen(PORT, () => console.log(`☕ CapuMail Backend running on http://localhost:${PORT}`));
+// ✅ แก้ Port สำหรับ Render
+const PORT = process.env.PORT || 5001;
+app.listen(PORT, () => console.log(`☕ CapuMail Backend running on port ${PORT}`));
