@@ -1,60 +1,120 @@
 const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
-const { simpleParser } = require('mailparser'); // ✅ แก้ชื่อจาก Parrer เป็น Parser
+const { simpleParser } = require('mailparser');
+const NodeCache = require("node-cache"); // 📌 เพิ่มระบบความจำชั่วคราว
 
 const app = express();
-app.use(cors()); 
+const myCache = new NodeCache({ stdTTL: 120 }); // ความจำเสื่อมใน 2 นาที
+const IMAP_HOST = 'capumail.com'; // ☕ ใช้โฮสต์ CapuMail
+
+// ปรับ CORS ให้รับการยิง API แบบมี Header
+app.use(cors({
+    origin: '*', 
+    methods: ['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-imap-user', 'x-imap-pass'],
+    credentials: true
+}));
+
 app.use(express.json());
 
-const IMAP_HOST = 'capumail.com'; 
+// 🦄 1. สร้างโกดังเก็บ Connection ที่ต่อติดแล้ว
+const activeClients = new Map();
 
-const getImapConfig = (req) => {
-    const user = req.headers['x-imap-user'];
-    const pass = req.headers['x-imap-pass'];
+// 🦄 2. ฟังก์ชันรีเซ็ตเวลา ถ้ามีการใช้งาน ให้ต่อเวลาไปอีก 5 นาที
+function resetIdleTimer(user, client) {
+    if (client.idleTimer) clearTimeout(client.idleTimer);
+    
+    client.idleTimer = setTimeout(async () => {
+        try { await client.logout(); } catch (e) {}
+        activeClients.delete(user);
+        console.log(`💤 [System] ตัดการเชื่อมต่อของ ${user} เพราะไม่ได้ใช้งานเกิน 5 นาที`);
+    }, 5 * 60 * 1000);
+}
+
+// 🦄 3. ฟังก์ชันเรียกใช้งาน IMAP (เปิดสายใหม่ หรือ เอาสายเก่ามาใช้)
+async function getImapClient(user, pass) {
     if (!user || !pass) throw new Error('Missing Credentials');
-    return {
+
+    if (activeClients.has(user)) {
+        const existingClient = activeClients.get(user);
+        if (existingClient.usable) {
+            resetIdleTimer(user, existingClient);
+            return existingClient;
+        } else {
+            activeClients.delete(user);
+        }
+    }
+
+    const client = new ImapFlow({ 
         host: IMAP_HOST, 
         port: 993, 
-        secure: true,
+        secure: true, 
         auth: { user, pass }, 
-        logger: false,
+        logger: false, 
         connectionTimeout: 15000 
-    };
-};
+    });
+
+    await client.connect();
+    activeClients.set(user, client);
+    resetIdleTimer(user, client);
+
+    client.on('close', () => activeClients.delete(user));
+    client.on('error', () => activeClients.delete(user));
+
+    return client;
+}
+
+// ----------------------------------------------------
+// ROUTES
+// ----------------------------------------------------
 
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
-    const client = new ImapFlow({ host: IMAP_HOST, port: 993, secure: true, auth: { user: email, pass: password } });
     try {
-        await client.connect();
-        await client.logout();
+        await getImapClient(email, password); // Pre-warm เซิร์ฟเวอร์
         res.json({ success: true });
-    } catch (err) { res.status(401).json({ success: false, error: err.message }); }
+    } catch (err) { 
+        res.status(401).json({ success: false, error: err.message }); 
+    }
 });
 
 app.get('/api/folders', async (req, res) => {
+    const user = req.headers['x-imap-user'];
+    const pass = req.headers['x-imap-pass'];
+    const cacheKey = `folders_${user}`; 
+
+    if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
+
     try {
-        const client = new ImapFlow(getImapConfig(req));
-        await client.connect();
+        const client = await getImapClient(user, pass);
         let folders = await client.list();
-        await client.logout();
-        res.json({ success: true, data: folders.map(f => ({ name: f.name, path: f.path })) });
+        
+        const responseData = { success: true, data: folders.map(f => ({ name: f.name, path: f.path })) };
+        myCache.set(cacheKey, responseData);
+        res.json(responseData);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/emails', async (req, res) => {
+    const user = req.headers['x-imap-user'];
+    const pass = req.headers['x-imap-pass'];
     const folderPath = req.query.folder || 'INBOX';
+    const cacheKey = `emails_${user}_${folderPath}`; 
+
+    if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
+
     try {
-        const client = new ImapFlow(getImapConfig(req));
-        await client.connect();
-        let lock = await client.getMailboxLock(folderPath);
+        const client = await getImapClient(user, pass);
+        let lock = await client.getMailboxLock(folderPath); 
         try {
             const mailbox = client.mailbox;
             if (mailbox.exists === 0) return res.json({ success: true, data: [] });
 
             let emails = [];
-            let start = Math.max(1, mailbox.exists - 14); 
+            // 🚀 ดึงแค่ 5 ฉบับล่าสุดเพื่อความรวดเร็ว
+            let start = Math.max(1, mailbox.exists - 4); 
+            
             for await (let msg of client.fetch(`${start}:*`, { envelope: true })) {
                 emails.push({
                     uid: msg.uid,
@@ -63,33 +123,46 @@ app.get('/api/emails', async (req, res) => {
                     date: msg.envelope.date
                 });
             }
-            res.json({ success: true, data: emails.reverse() });
-        } finally { lock.release(); await client.logout(); }
+            
+            const responseData = { success: true, data: emails.reverse() };
+            myCache.set(cacheKey, responseData);
+            res.json(responseData);
+        } finally { 
+            lock.release(); 
+        }
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✅ แก้ไขส่วนดึง Content ให้ใช้ Parser เพื่อลบ Header รกๆ ออก
 app.get('/api/email-content', async (req, res) => {
+    const user = req.headers['x-imap-user'];
+    const pass = req.headers['x-imap-pass'];
     const { folder, uid } = req.query;
+    const cacheKey = `content_${user}_${folder}_${uid}`; 
+
+    if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
+
     try {
-        const client = new ImapFlow(getImapConfig(req));
-        await client.connect();
+        const client = await getImapClient(user, pass);
         let lock = await client.getMailboxLock(folder || 'INBOX');
         try {
             let message = await client.fetchOne(uid, { source: true });
-            
-            // 🛠️ ถอดรหัส Source Code ของเมลให้กลายเป็นข้อความอ่านง่าย
             const parsed = await simpleParser(message.source);
             
-            res.json({ 
+            const responseData = { 
                 success: true, 
-                // ส่งค่าที่เป็น HTML หรือถ้าไม่มีให้ส่ง Text ธรรมดาไป
                 content: parsed.html || parsed.textAsHtml || parsed.text || "No Content" 
-            });
-        } finally { lock.release(); await client.logout(); }
+            };
+
+            myCache.set(cacheKey, responseData);
+            res.json(responseData);
+        } finally { 
+            lock.release(); 
+        }
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✅ แก้ Port สำหรับ Render
 const PORT = process.env.PORT || 5001;
-app.listen(PORT, () => console.log(`☕ CapuMail Backend running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`☕ CapuMail Backend running on port ${PORT}`);
+    console.log(`🚀 Caching & Pooling Activated! (5 latest emails)`);
+});
